@@ -800,7 +800,7 @@ def display_main_content(df):
     analysis_time = None
     if user_history_text:
         # 사용자 기록 텍스트에서 분석 기준 시점(가장 최근 이벤트 시간) 추출
-        matches = re.findall(r'\[(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})', user_history_text)
+        matches = re.findall(r'UTC 시각:\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})', user_history_text)
         time_string_for_parsing = matches[-1] if matches else None
 
         parsed_dt = parse_analysis_time(time_string_for_parsing)
