@@ -735,31 +735,61 @@ def display_main_content(df):
     if 'user_idx' not in st.session_state: st.session_state.user_idx = 0
     if 'theme_evals' not in st.session_state: st.session_state.theme_evals = {}
     if 'tag_evals' not in st.session_state: st.session_state.tag_evals = {}
-    if 'quant_stats' not in st.session_state: st.session_state.quant_stats = {}  # 정량 지표 저장소
+    if 'quant_stats' not in st.session_state: st.session_state.quant_stats = {}
 
     user_ids = df['user_id'].unique()
     total_users = len(user_ids)
 
-    # --- [MODIFIED LOGIC] END SCREEN CHECK ---
-    # 유저 인덱스가 전체 유저 수 이상이면 "평가 완료" 화면(누적 리포트)만 출력
+    # --- [수정 1] 완료 화면 체크 로직 ---
     if st.session_state.user_idx >= total_users:
         st.title("🎉 모든 평가가 완료되었습니다!")
         st.info("수고하셨습니다. 아래는 최종 집계된 누적 평가 리포트입니다.")
         display_aggregate_stats()
-
         st.markdown("<br><br>", unsafe_allow_html=True)
         if st.button("🔄 처음부터 다시 하기", use_container_width=True):
             st.session_state.user_idx = 0
+            st.session_state.quant_stats = {}  # (선택사항) 통계 초기화
             st.rerun()
-        return  # 함수 종료 (개별 유저 상세 화면 렌더링 안 함)
+        return
 
-    # --- NORMAL FLOW (평가 진행 중) ---
     curr_user_id = user_ids[st.session_state.user_idx]
 
+    # --- [수정 2] 데이터 파싱 및 지표 계산을 '버튼 렌더링 전'인 최상단으로 이동 ---
+    user_rows = df[df['user_id'] == curr_user_id]
+    row = user_rows.iloc[0]
+
+    # Parsing
+    prompts_data = safe_parse(row.get('prompts'))
+    user_history_text = prompts_data['user_prompt'] if isinstance(prompts_data, dict) else (
+        row.get('prompts') if isinstance(row.get('prompts'), str) else "")
+
+    llm_result = safe_parse(row.get('theme_results'))
+    themes = llm_result if isinstance(llm_result, list) else (
+        llm_result.get('recommendation_themes', llm_result.get('themes', [])) if isinstance(llm_result, dict) else [])
+
+    # Calculate Metrics (미리 계산만 해두고 저장은 아직 안 함)
+    target_tags_raw = safe_parse(row.get('target_tags', ''))
+    target_tags_list = extract_tags_list(target_tags_raw)
+
+    # 정량 지표 계산
+    current_quant_metrics = (0.0, 0.0, 0.0)
+    theme_0_tags = []
+
+    if themes:
+        t0_products = themes[0].get('recommendations',
+                                    themes[0].get('recommended_products', themes[0].get('products', [])))
+        all_theme_tags = set()
+        for prod in t0_products:
+            all_theme_tags.update(extract_tags_list(prod.get('tags', [])))
+        theme_0_tags = sorted(list(all_theme_tags))
+
+        # A, B, C 지표 계산 (저장 X)
+        current_quant_metrics = calculate_quantitative_metrics(target_tags_list, t0_products)
+
+    # --- [수정 3] Navigation 영역 및 버튼 로직 수정 ---
     if curr_user_id not in st.session_state.theme_evals: st.session_state.theme_evals[curr_user_id] = {}
     if curr_user_id not in st.session_state.tag_evals: st.session_state.tag_evals[curr_user_id] = []
 
-    # Navigation
     with st.container():
         col_nav_1, col_nav_2, col_nav_3 = st.columns([2, 4, 1.5], gap="small")
         with col_nav_1:
@@ -773,65 +803,32 @@ def display_main_content(df):
             </div>""", unsafe_allow_html=True)
         with col_nav_2:
             current_progress_idx = st.session_state.user_idx + 1
-            st.write("");
+            st.write("")
             st.progress(current_progress_idx / total_users)
             st.markdown(
                 f"<div style='text-align:right; font-size:0.8rem; color:#64748b; margin-top:-5px;'>진행률: {current_progress_idx} / {total_users}</div>",
                 unsafe_allow_html=True)
         with col_nav_3:
             st.write("")
-            # [MODIFIED LOGIC] Next User Button
-            # 마지막 유저일 때 누르면 user_idx가 total_users가 되어 위쪽 '완료 화면' 조건에 걸리게 됨
             btn_label = "다음 유저 보기 ➡️" if current_progress_idx < total_users else "평가 완료 및 리포트 보기 🏁"
+
+            # [핵심 수정] 버튼을 클릭했을 때만 현재 계산된 지표(current_quant_metrics)를 저장하고 넘어감
             if st.button(btn_label, use_container_width=True):
-                st.session_state.user_idx += 1  # 단순히 1 증가 (modulo 제거)
+                # 1. 현재 유저의 정량 지표 저장
+                st.session_state.quant_stats[curr_user_id] = current_quant_metrics
+                # 2. 다음 유저로 인덱스 이동
+                st.session_state.user_idx += 1
                 st.rerun()
 
-    user_rows = df[df['user_id'] == curr_user_id]
-    row = user_rows.iloc[0]
     st.markdown("<div style='margin-bottom:20px; border-bottom:1px solid #e2e8f0;'></div>", unsafe_allow_html=True)
 
-    # Parsing
-    prompts_data = safe_parse(row.get('prompts'))
-    user_history_text = prompts_data['user_prompt'] if isinstance(prompts_data, dict) else (
-        row.get('prompts') if isinstance(row.get('prompts'), str) else "")
-
-    # 3. 'parse_analysis_time' 호출 로직 수정
+    # --- Time Parsing (UI 표시용) ---
     analysis_time = None
     if user_history_text:
-        # 사용자 기록 텍스트에서 분석 기준 시점(가장 최근 이벤트 시간) 추출
         matches = re.findall(r'UTC 시각:\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})', user_history_text)
         time_string_for_parsing = matches[-1] if matches else None
-
         parsed_dt = parse_analysis_time(time_string_for_parsing)
-        # datetime 객체를 출력용 문자열로 다시 포맷
         analysis_time = parsed_dt.strftime('%Y-%m-%d %H:%M') if parsed_dt else None
-
-    llm_result = safe_parse(row.get('theme_results'))
-    themes = llm_result if isinstance(llm_result, list) else (
-        llm_result.get('recommendation_themes', llm_result.get('themes', [])) if isinstance(llm_result, dict) else [])
-
-    # Calculate Data for Quant Metrics
-    target_tags_raw = safe_parse(row.get('target_tags', ''))
-    target_tags_list = extract_tags_list(target_tags_raw)
-
-    theme_0_tags = []
-    quant_metrics = (0.0, 0.0, 0.0)
-
-    if themes:
-        # Theme 1 Tags for Eval
-        t0_products = themes[0].get('recommendations',
-                                    themes[0].get('recommended_products', themes[0].get('products', [])))
-        all_theme_tags = set()
-        for prod in t0_products:
-            all_theme_tags.update(extract_tags_list(prod.get('tags', [])))
-        theme_0_tags = sorted(list(all_theme_tags))
-
-        # Calculate A, B, C based on Theme 1 (First pool) vs Target
-        quant_metrics = calculate_quantitative_metrics(target_tags_list, t0_products)
-
-        # Save current user quant stats to session
-        st.session_state.quant_stats[curr_user_id] = quant_metrics
 
     # Layout
     col1, col2, col3 = st.columns([1.1, 1.1, 0.8], gap="medium")
@@ -885,7 +882,6 @@ def display_main_content(df):
                             p_price = prod.get('price', 0)
                             p_cat = prod.get('category', '기타')
                             try:
-                                # Safe float conversion for formatting
                                 p_price_fmt = f"{int(float(str(p_price).replace(',', '').replace('원', '').strip())):,}원"
                             except:
                                 p_price_fmt = f"{p_price}원"
@@ -922,14 +918,10 @@ def display_main_content(df):
                 f"<div class='eval-box'><div class='eval-label'><span>📝</span> EVALUATION (Theme 1)</div></div>",
                 unsafe_allow_html=True)
 
-            # --- FIXED SECTION START: Multiselect Callback Logic ---
             saved_tags = st.session_state.tag_evals[curr_user_id]
             valid_defaults = [t for t in saved_tags if t in theme_0_tags]
-
-            # Key for the widget
             widget_key = f"tag_select_{curr_user_id}"
 
-            # Callback to update state immediately upon interaction
             def update_tag_state():
                 st.session_state.tag_evals[curr_user_id] = st.session_state[widget_key]
 
@@ -943,9 +935,8 @@ def display_main_content(df):
             if st.session_state.tag_evals[curr_user_id]:
                 st.info("선택된 태그는 좌측 목록에서 하이라이트 됩니다.")
 
-    # 평가 진행 중에도 하단에 리포트가 보이길 원하시면 아래 주석을 해제하세요.
+    # [수정 4] 평가 진행 중 리포트 - 아직 저장된 데이터가 없으면 0.0으로 깔끔하게 나옵니다.
     display_aggregate_stats()
-
 
 def app_runner():
     st.title("🛍️ 추천 결과 평가 데모")
